@@ -5,18 +5,67 @@ pragma solidity 0.8.20;
 import "./lib/DepositContractV2.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/IERC20MetadataUpgradeable.sol";
-import "../lib/TokenWrapped.sol";
 import "../interfaces/IBasePolygonZkEVMGlobalExitRoot.sol";
 import "../interfaces/IBridgeMessageReceiver.sol";
 import "./interfaces/IPolygonZkEVMBridgeV2.sol";
 import "../lib/EmergencyManager.sol";
 import "../lib/GlobalExitRootLib.sol";
 
+
+interface IERCXXX {
+    function DOMAIN_TYPEHASH() external view returns (bytes32);
+    function PERMIT_TYPEHASH() external view returns (bytes32);
+    function VERSION() external view returns (string memory);
+    function deploymentChainId() external view returns (uint256);
+    function bridgeAddress() external view returns (address);
+    function nonces(address owner) external view returns (uint256);
+    function SHARE_PRICE_PRECISION() external view returns (uint256);
+    function sharePrice() external view returns (uint256);
+    function totalBorrowableShares() external view returns (uint256);
+    function borrowBlacklist(address account) external view returns (bool);
+    function maxBorrowSupplyToRealSupplyRatio() external view returns (uint256);
+    function totalBorrowedSupply() external view returns (uint256);
+    function name() external view returns (string memory);
+    function symbol() external view returns (string memory);
+    function decimals() external view returns (uint8);
+    function balanceOf(address account) external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+    function totalBorrowableSupply() external view returns (uint256);
+    function currentBorrowableSupply() external view returns (uint256);
+    function realTotalSupply() external view returns (uint256);
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+
+    function initialize(
+        address _core,
+        string calldata erc20name,
+        string calldata erc20symbol,
+        uint8 __decimals
+    ) external;
+
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    function mint(address account, uint256 value) external;
+    function burn(address account, uint256 value) external;
+    function setBorrowBlacklist(address account, bool value) external;
+    function setMaxBorrowSupplyToRealSupplyRatio(uint256 value) external;
+    function setSharePrice(uint256 value) external;
+    function mintForBorrow(address to, uint256 amount) external;
+    function burnForRepay(address from, uint256 amount) external;
+}
+
 /**
  * PolygonZkEVMBridge that will be deployed on Ethereum and all Polygon rollups
  * Contract responsible to manage the token interactions with other networks
  */
-contract PolygonZkEVMBridgeV3 is
+contract PolygonZkEVMBridgeERCXXX is
     DepositContractV2,
     EmergencyManager,
     IPolygonZkEVMBridgeV2
@@ -54,9 +103,7 @@ contract PolygonZkEVMBridgeV3 is
     uint256 private constant _GLOBAL_INDEX_MAINNET_FLAG = 2 ** 64;
 
     // Init code of the erc20 wrapped token, to deploy a wrapped token the constructor parameters must be appended
-    // Update Lendchain: this is the bytecode of a transparent upgradable proxy contract
-    bytes public constant BASE_INIT_BYTECODE_WRAPPED_TOKEN =
-        hex"abcdef123456";
+    bytes public constant BASE_INIT_BYTECODE_WRAPPED_TOKEN = hex"00";
 
     // Network identifier
     uint32 public networkID;
@@ -90,7 +137,11 @@ contract PolygonZkEVMBridgeV3 is
     bytes public gasTokenMetadata;
 
     // WETH address
-    TokenWrapped public WETHToken;
+    IERCXXX public WETHToken;
+
+    address public core;
+
+    bytes public ercxxxBytecode;
 
     /**
      * @dev Emitted when bridge assets or messages to another network
@@ -173,8 +224,9 @@ contract PolygonZkEVMBridgeV3 is
             // Create a wrapped token for WETH, with salt == 0
             WETHToken = _deployWrappedToken(
                 0, // salt
-                abi.encode("Wrapped Ether", "WETH", 18)
-            );
+                "Wrapped Ether", 
+                "WETH", 
+                18);
         }
 
         // Initialize OZ contracts
@@ -239,7 +291,7 @@ contract PolygonZkEVMBridgeV3 is
             // In case ether is the native token, WETHToken will be 0, and the address 0 is already checked
             if (token == address(WETHToken)) {
                 // Burn tokens
-                TokenWrapped(token).burn(msg.sender, amount);
+                IERCXXX(token).burn(msg.sender, amount);
 
                 // Both origin network and originTokenAddress will be 0
                 // Metadata will be empty
@@ -252,7 +304,7 @@ contract PolygonZkEVMBridgeV3 is
                     // The token is a wrapped token from another network
 
                     // Burn tokens
-                    TokenWrapped(token).burn(msg.sender, amount);
+                    IERCXXX(token).burn(msg.sender, amount);
 
                     originTokenAddress = tokenInfo.originTokenAddress;
                     originNetwork = tokenInfo.originNetwork;
@@ -530,10 +582,13 @@ contract PolygonZkEVMBridgeV3 is
                     if (wrappedToken == address(0)) {
                         // Get ERC20 metadata
 
+                        (string memory name, string memory symbol, uint8 decimals) = abi.decode(metadata, (string, string, uint8));
                         // Create a new wrapped erc20 using create2
-                        TokenWrapped newWrappedToken = _deployWrappedToken(
+                        IERCXXX newWrappedToken = _deployWrappedToken(
                             tokenInfoHash,
-                            metadata
+                            name,
+                            symbol,
+                            decimals
                         );
 
                         // Mint tokens for the destination address
@@ -556,7 +611,7 @@ contract PolygonZkEVMBridgeV3 is
                         );
                     } else {
                         // Use the existing wrapped erc20
-                        TokenWrapped(wrappedToken).mint(
+                        IERCXXX(wrappedToken).mint(
                             destinationAddress,
                             amount
                         );
@@ -694,17 +749,17 @@ contract PolygonZkEVMBridgeV3 is
             abi.encodePacked(originNetwork, originTokenAddress)
         );
 
+        bytes memory bytecode = ercxxxBytecode.length == 0 ? abi.encodePacked(
+                        BASE_INIT_BYTECODE_WRAPPED_TOKEN,
+                        abi.encode(name, symbol, decimals)
+                    ) : ercxxxBytecode;
+
         bytes32 hashCreate2 = keccak256(
             abi.encodePacked(
                 bytes1(0xff),
                 address(this),
                 salt,
-                keccak256(
-                    abi.encodePacked(
-                        BASE_INIT_BYTECODE_WRAPPED_TOKEN,
-                        abi.encode(name, symbol, decimals)
-                    )
-                )
+                keccak256(bytecode)
             )
         );
 
@@ -1023,20 +1078,15 @@ contract PolygonZkEVMBridgeV3 is
         }
     }
 
-    /**
-     * @notice Internal function that uses create2 to deploy the wrapped tokens
-     * @param salt Salt used in create2 params,
-     * tokenInfoHash will be used as salt for all wrappeds except for bridge native WETH, that will be bytes32(0)
-     * @param constructorArgs Encoded constructor args for the wrapped token
-     */
     function _deployWrappedToken(
         bytes32 salt,
-        bytes memory constructorArgs
-    ) internal returns (TokenWrapped newWrappedToken) {
-        bytes memory initBytecode = abi.encodePacked(
-            BASE_INIT_BYTECODE_WRAPPED_TOKEN,
-            constructorArgs
-        );
+        string memory name,
+        string memory symbol,
+        uint8 decimals
+    ) internal returns (IERCXXX newWrappedToken) {
+        bytes memory initBytecode = ercxxxBytecode.length == 0 ?
+            abi.encodePacked(BASE_INIT_BYTECODE_WRAPPED_TOKEN, abi.encode(name, symbol, decimals))
+            : ercxxxBytecode;
 
         /// @solidity memory-safe-assembly
         assembly {
@@ -1049,6 +1099,10 @@ contract PolygonZkEVMBridgeV3 is
         }
         if (address(newWrappedToken) == address(0))
             revert FailedTokenWrappedDeployment();
+
+        require(core != address(0), "Core is not set");
+
+        IERCXXX(newWrappedToken).initialize(core, name, symbol, decimals);
     }
 
     // Helpers to safely get the metadata from a token, inspired by https://github.com/traderjoe-xyz/joe-core/blob/main/contracts/MasterChefJoeV3.sol#L55-L95
@@ -1157,5 +1211,13 @@ contract PolygonZkEVMBridgeV3 is
                 _safeSymbol(token),
                 _safeDecimals(token)
             );
+    }
+
+    function setBytecode(bytes memory _bytecode) external {
+        ercxxxBytecode = _bytecode;
+    }
+
+    function setCore(address _core) external {
+        core = _core;
     }
 }
